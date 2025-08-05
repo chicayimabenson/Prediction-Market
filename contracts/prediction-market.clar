@@ -228,8 +228,14 @@
 
 (define-constant err-invalid-category (err u109))
 (define-constant err-invalid-limit (err u110))
+(define-constant err-invalid-coverage (err u111))
+(define-constant err-insurance-exists (err u112))
+(define-constant err-no-insurance (err u113))
+(define-constant err-claim-processed (err u114))
+(define-constant err-insufficient-pool (err u115))
 
 (define-data-var next-category-id uint u1)
+(define-data-var insurance-pool uint u0)
 
 (define-map categories
   { category-id: uint }
@@ -275,6 +281,26 @@
   }
 )
 
+(define-map insurance-policies
+  { market-id: uint, user: principal }
+  {
+    coverage-amount: uint,
+    premium-paid: uint,
+    bet-outcome: uint,
+    bet-amount: uint,
+    claim-processed: bool
+  }
+)
+
+(define-map market-insurance-stats
+  { market-id: uint }
+  {
+    total-policies: uint,
+    total-premiums: uint,
+    total-coverage: uint
+  }
+)
+
 (define-read-only (get-category (category-id uint))
   (map-get? categories { category-id: category-id })
 )
@@ -295,6 +321,31 @@
 
 (define-read-only (get-next-category-id)
   (var-get next-category-id)
+)
+
+(define-read-only (get-insurance-policy (market-id uint) (user principal))
+  (map-get? insurance-policies { market-id: market-id, user: user })
+)
+
+(define-read-only (get-insurance-pool)
+  (var-get insurance-pool)
+)
+
+(define-read-only (calculate-insurance-premium (bet-amount uint) (coverage-percentage uint))
+  (let (
+    (base-rate u5)
+    (coverage-ratio (/ (* coverage-percentage u100) u100))
+    (premium (/ (* bet-amount base-rate coverage-ratio) u1000))
+  )
+    (if (< premium u1) u1 premium)
+  )
+)
+
+(define-read-only (get-market-insurance-stats (market-id uint))
+  (default-to 
+    { total-policies: u0, total-premiums: u0, total-coverage: u0 }
+    (map-get? market-insurance-stats { market-id: market-id })
+  )
 )
 
 (define-public (create-category (name (string-ascii 50)) (description (string-ascii 200)))
@@ -466,6 +517,77 @@
       { category-id: category-id }
       (merge category { total-volume: (+ (get total-volume category) volume-increase) })
     )
+    (ok true)
+  )
+)
+
+(define-public (purchase-insurance (market-id uint) (bet-outcome uint) (bet-amount uint) (coverage-percentage uint))
+  (let (
+    (market (unwrap! (get-market market-id) err-not-found))
+    (premium (calculate-insurance-premium bet-amount coverage-percentage))
+    (coverage-amount (/ (* bet-amount coverage-percentage) u100))
+    (current-stats (get-market-insurance-stats market-id))
+  )
+    (asserts! (and (> coverage-percentage u0) (<= coverage-percentage u100)) err-invalid-coverage)
+    (asserts! (is-none (get-insurance-policy market-id tx-sender)) err-insurance-exists)
+    (asserts! (>= (stx-get-balance tx-sender) premium) err-insufficient-funds)
+    (asserts! (< stacks-block-height (get end-block market)) err-market-closed)
+    (asserts! (not (get resolved market)) err-market-resolved)
+    
+    (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+    (var-set insurance-pool (+ (var-get insurance-pool) premium))
+    
+    (map-set insurance-policies
+      { market-id: market-id, user: tx-sender }
+      {
+        coverage-amount: coverage-amount,
+        premium-paid: premium,
+        bet-outcome: bet-outcome,
+        bet-amount: bet-amount,
+        claim-processed: false
+      }
+    )
+    
+    (map-set market-insurance-stats
+      { market-id: market-id }
+      {
+        total-policies: (+ (get total-policies current-stats) u1),
+        total-premiums: (+ (get total-premiums current-stats) premium),
+        total-coverage: (+ (get total-coverage current-stats) coverage-amount)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-insurance (market-id uint))
+  (let (
+    (market (unwrap! (get-market market-id) err-not-found))
+    (policy (unwrap! (get-insurance-policy market-id tx-sender) err-no-insurance))
+    (winning-outcome (unwrap! (get winning-outcome market) err-market-active))
+    (coverage-amount (get coverage-amount policy))
+  )
+    (asserts! (get resolved market) err-market-active)
+    (asserts! (not (get claim-processed policy)) err-claim-processed)
+    (asserts! (not (is-eq (get bet-outcome policy) winning-outcome)) err-invalid-outcome)
+    (asserts! (>= (var-get insurance-pool) coverage-amount) err-insufficient-pool)
+    
+    (map-set insurance-policies
+      { market-id: market-id, user: tx-sender }
+      (merge policy { claim-processed: true })
+    )
+    
+    (var-set insurance-pool (- (var-get insurance-pool) coverage-amount))
+    (as-contract (stx-transfer? coverage-amount tx-sender tx-sender))
+  )
+)
+
+(define-public (fund-insurance-pool (amount uint))
+  (begin
+    (asserts! (>= (stx-get-balance tx-sender) amount) err-insufficient-funds)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set insurance-pool (+ (var-get insurance-pool) amount))
     (ok true)
   )
 )
