@@ -205,6 +205,10 @@
     (market (unwrap! (get-market market-id) err-not-found))
     (user-bet (unwrap! (get-user-bet market-id tx-sender) err-no-bet))
     (payout (unwrap! (calculate-payout market-id tx-sender) err-market-active))
+    (winning-outcome (unwrap! (get winning-outcome market) err-market-active))
+    (bet-amount (+ (get yes-amount user-bet) (get no-amount user-bet)))
+    (profit (if (> payout bet-amount) (- payout bet-amount) u0))
+    (is-winner (> payout bet-amount))
   )
     (asserts! (get resolved market) err-market-active)
     (asserts! (not (get claimed user-bet)) err-already-exists)
@@ -214,6 +218,8 @@
       { market-id: market-id, user: tx-sender }
       (merge user-bet { claimed: true })
     )
+    
+    (unwrap-panic (update-user-performance tx-sender bet-amount profit is-winner))
     
     (as-contract (stx-transfer? payout tx-sender tx-sender))
   )
@@ -266,6 +272,8 @@
 (define-constant err-already-rated (err u116))
 (define-constant err-invalid-rating (err u117))
 (define-constant err-self-rating (err u118))
+(define-constant err-achievement-claimed (err u119))
+(define-constant err-achievement-locked (err u120))
 
 (define-data-var next-category-id uint u1)
 (define-data-var insurance-pool uint u0)
@@ -367,6 +375,38 @@
   { ratings-given: uint }
 )
 
+(define-map user-performance
+  { user: principal }
+  {
+    total-bets: uint,
+    winning-bets: uint,
+    total-wagered: uint,
+    total-profit: uint,
+    current-streak: uint,
+    best-streak: uint,
+    performance-score: uint
+  }
+)
+
+(define-map user-achievements
+  { user: principal, achievement-id: uint }
+  {
+    unlocked: bool,
+    unlocked-at: uint
+  }
+)
+
+(define-map leaderboard-entry
+  { user: principal }
+  {
+    rank: uint,
+    total-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-data-var leaderboard-size uint u0)
+
 (define-read-only (get-category (category-id uint))
   (map-get? categories { category-id: category-id })
 )
@@ -439,6 +479,76 @@
     (volume-bonus (if (> markets-created u10) u50 u0))
   )
     (+ u500 resolution-rate time-bonus volume-bonus)
+  )
+)
+
+(define-read-only (get-user-performance (user principal))
+  (default-to 
+    { total-bets: u0, winning-bets: u0, total-wagered: u0, total-profit: u0, current-streak: u0, best-streak: u0, performance-score: u0 }
+    (map-get? user-performance { user: user })
+  )
+)
+
+(define-read-only (get-user-achievement (user principal) (achievement-id uint))
+  (default-to 
+    { unlocked: false, unlocked-at: u0 }
+    (map-get? user-achievements { user: user, achievement-id: achievement-id })
+  )
+)
+
+(define-read-only (get-leaderboard-entry (user principal))
+  (map-get? leaderboard-entry { user: user })
+)
+
+(define-read-only (calculate-performance-score (total-bets uint) (winning-bets uint) (total-profit uint))
+  (let (
+    (win-rate (if (> total-bets u0) (/ (* winning-bets u1000) total-bets) u0))
+    (profit-score (/ total-profit u100))
+    (volume-multiplier (if (> total-bets u50) u2 u1))
+  )
+    (* (+ win-rate profit-score) volume-multiplier)
+  )
+)
+
+(define-read-only (check-achievement-eligibility (user principal) (achievement-id uint))
+  (let (
+    (perf (get-user-performance user))
+  )
+    (if (is-eq achievement-id u1)
+      (>= (get total-bets perf) u10)
+      (if (is-eq achievement-id u2)
+        (>= (get winning-bets perf) u25)
+        (if (is-eq achievement-id u3)
+          (>= (get current-streak perf) u5)
+          (if (is-eq achievement-id u4)
+            (>= (get total-profit perf) u1000000)
+            (if (is-eq achievement-id u5)
+              (>= (get total-bets perf) u100)
+              false
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-achievement-name (achievement-id uint))
+  (if (is-eq achievement-id u1)
+    "Novice Bettor"
+    (if (is-eq achievement-id u2)
+      "Winning Streak"
+      (if (is-eq achievement-id u3)
+        "Hot Hand"
+        (if (is-eq achievement-id u4)
+          "Profit Master"
+          (if (is-eq achievement-id u5)
+            "Century Club"
+            "Unknown"
+          )
+        )
+      )
+    )
   )
 )
 
@@ -758,5 +868,117 @@
       (>= (get reputation-score rep) u600)
       (>= (/ (* (get markets-resolved rep) u100) (get markets-created rep)) u80)
     )
+  )
+)
+
+(define-public (update-user-performance (user principal) (bet-amount uint) (profit uint) (is-winner bool))
+  (let (
+    (current-perf (get-user-performance user))
+    (new-total-bets (+ (get total-bets current-perf) u1))
+    (new-winning-bets (if is-winner (+ (get winning-bets current-perf) u1) (get winning-bets current-perf)))
+    (new-total-wagered (+ (get total-wagered current-perf) bet-amount))
+    (new-total-profit (+ (get total-profit current-perf) profit))
+    (new-streak (if is-winner (+ (get current-streak current-perf) u1) u0))
+    (new-best-streak (if (> new-streak (get best-streak current-perf)) new-streak (get best-streak current-perf)))
+    (new-score (calculate-performance-score new-total-bets new-winning-bets new-total-profit))
+  )
+    (map-set user-performance
+      { user: user }
+      {
+        total-bets: new-total-bets,
+        winning-bets: new-winning-bets,
+        total-wagered: new-total-wagered,
+        total-profit: new-total-profit,
+        current-streak: new-streak,
+        best-streak: new-best-streak,
+        performance-score: new-score
+      }
+    )
+    
+    (unwrap-panic (update-leaderboard user new-score))
+    (ok true)
+  )
+)
+
+(define-public (claim-achievement (achievement-id uint))
+  (let (
+    (current-achievement (get-user-achievement tx-sender achievement-id))
+    (is-eligible (check-achievement-eligibility tx-sender achievement-id))
+  )
+    (asserts! (not (get unlocked current-achievement)) err-achievement-claimed)
+    (asserts! is-eligible err-achievement-locked)
+    
+    (map-set user-achievements
+      { user: tx-sender, achievement-id: achievement-id }
+      {
+        unlocked: true,
+        unlocked-at: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-leaderboard (user principal) (score uint))
+  (let (
+    (current-entry (get-leaderboard-entry user))
+  )
+    (match current-entry
+      entry (begin
+        (map-set leaderboard-entry
+          { user: user }
+          {
+            rank: (get rank entry),
+            total-score: score,
+            last-updated: stacks-block-height
+          }
+        )
+        (ok true)
+      )
+      (begin
+        (map-set leaderboard-entry
+          { user: user }
+          {
+            rank: (+ (var-get leaderboard-size) u1),
+            total-score: score,
+            last-updated: stacks-block-height
+          }
+        )
+        (var-set leaderboard-size (+ (var-get leaderboard-size) u1))
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-read-only (get-top-performers (limit uint))
+  (begin
+    (asserts! (and (> limit u0) (<= limit u20)) err-invalid-limit)
+    (ok limit)
+  )
+)
+
+(define-read-only (get-user-rank (user principal))
+  (match (get-leaderboard-entry user)
+    entry (ok (get rank entry))
+    err-not-found
+  )
+)
+
+(define-read-only (get-user-stats (user principal))
+  (let (
+    (perf (get-user-performance user))
+    (win-rate (if (> (get total-bets perf) u0) 
+      (/ (* (get winning-bets perf) u100) (get total-bets perf))
+      u0))
+  )
+    (ok {
+      performance: perf,
+      win-rate: win-rate,
+      avg-bet-size: (if (> (get total-bets perf) u0) 
+        (/ (get total-wagered perf) (get total-bets perf))
+        u0)
+    })
   )
 )
