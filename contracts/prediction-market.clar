@@ -9,6 +9,38 @@
 (define-constant err-no-bet (err u107))
 (define-constant err-market-active (err u108))
 
+(define-map user-preferences
+  { user: principal }
+  {
+    notify-market-resolved: bool,
+    notify-market-activity: bool,
+    notify-insurance: bool,
+    channel: (string-ascii 120)
+  }
+)
+
+(define-read-only (get-user-preferences (user principal))
+  (default-to
+    { notify-market-resolved: false, notify-market-activity: false, notify-insurance: false, channel: "" }
+    (map-get? user-preferences { user: user })
+  )
+)
+
+(define-public (set-user-preferences (notify-market-resolved bool) (notify-market-activity bool) (notify-insurance bool) (channel (string-ascii 120)))
+  (begin
+    (map-set user-preferences
+      { user: tx-sender }
+      {
+        notify-market-resolved: notify-market-resolved,
+        notify-market-activity: notify-market-activity,
+        notify-insurance: notify-insurance,
+        channel: channel
+      }
+    )
+    (ok true)
+  )
+)
+
 (define-data-var next-market-id uint u1)
 
 (define-map markets
